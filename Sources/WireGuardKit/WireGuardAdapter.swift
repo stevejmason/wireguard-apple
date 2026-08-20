@@ -57,36 +57,84 @@ public class WireGuardAdapter {
     private var state: State = .stopped
 
     /// Tunnel device file descriptor.
+    ///
+    /// Resolved from `packetFlow` where possible, and only otherwise by scanning open descriptors.
+    /// The distinction matters whenever the provider process OUTLIVES a tunnel session.
+    ///
+    /// The scan returns a descriptor that is *a* utun control socket, which is only the same thing as
+    /// *this session's* utun while the process holds exactly one. That holds for an app extension,
+    /// which is torn down after every disconnect. It does not hold for a packet tunnel packaged as a
+    /// macOS SYSTEM extension: there the process is a resident daemon that serves many start/stop
+    /// cycles, so a descriptor leaked by an earlier session is still open, has a lower number, and
+    /// wins the scan.
+    ///
+    /// The resulting failure is close to undiagnosable from the outside. WireGuard binds to the stale
+    /// interface while the system applies the address and routes to the new one, so the handshake
+    /// completes at both ends (the UDP socket is unrelated to the tun fd), keepalives flow (they are
+    /// generated internally), the routing table is correct, and the peer reports healthy counters —
+    /// while not one user packet is ever encrypted, because packets enter an interface nobody reads.
+    /// It presents as a connected VPN that carries no traffic, and survives reconnecting, because
+    /// only restarting the process closes the descriptor.
+    ///
+    /// `packetFlow` is the session's own object, so its descriptor is unambiguous. It is reached by
+    /// KVC on a private key path, hence the fallback: the value is validated as a utun control socket
+    /// before use, and anything unexpected drops through to the scan rather than binding blind.
     private var tunnelFileDescriptor: Int32? {
+        if let fd = packetFlowFileDescriptor, WireGuardAdapter.isUtunControlSocket(fd) {
+            return fd
+        }
+        return WireGuardAdapter.scannedTunnelFileDescriptor
+    }
+
+    /// The descriptor backing this session's `packetFlow`, or nil if it cannot be read.
+    private var packetFlowFileDescriptor: Int32? {
+        guard let value = packetTunnelProvider?.packetFlow.value(forKeyPath: "socket.fileDescriptor")
+        else { return nil }
+        guard let fd = (value as? NSNumber)?.int32Value ?? (value as? Int32), fd >= 0 else {
+            return nil
+        }
+        return fd
+    }
+
+    /// True when `fd` is an open utun control socket.
+    private static func isUtunControlSocket(_ fd: Int32) -> Bool {
         var ctlInfo = ctl_info()
         withUnsafeMutablePointer(to: &ctlInfo.ctl_name) {
             $0.withMemoryRebound(to: CChar.self, capacity: MemoryLayout.size(ofValue: $0.pointee)) {
                 _ = strcpy($0, "com.apple.net.utun_control")
             }
         }
-        for fd: Int32 in 0...1024 {
-            var addr = sockaddr_ctl()
-            var ret: Int32 = -1
-            var len = socklen_t(MemoryLayout.size(ofValue: addr))
-            withUnsafeMutablePointer(to: &addr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    ret = getpeername(fd, $0, &len)
-                }
-            }
-            if ret != 0 || addr.sc_family != AF_SYSTEM {
-                continue
-            }
-            if ctlInfo.ctl_id == 0 {
-                ret = ioctl(fd, CTLIOCGINFO, &ctlInfo)
-                if ret != 0 {
-                    continue
-                }
-            }
-            if addr.sc_id == ctlInfo.ctl_id {
-                return fd
+
+        var addr = sockaddr_ctl()
+        var ret: Int32 = -1
+        var len = socklen_t(MemoryLayout.size(ofValue: addr))
+        withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                ret = getpeername(fd, $0, &len)
             }
         }
-        return nil
+        if ret != 0 || addr.sc_family != AF_SYSTEM {
+            return false
+        }
+        if ioctl(fd, CTLIOCGINFO, &ctlInfo) != 0 {
+            return false
+        }
+        return addr.sc_id == ctlInfo.ctl_id
+    }
+
+    /// Scan open descriptors for a utun control socket.
+    ///
+    /// Returns the HIGHEST match rather than the first. Where a descriptor has leaked, the live
+    /// session's is the one opened most recently and therefore occupies the higher slot, since the
+    /// stale one still holds its lower slot. That is a heuristic and not a guarantee, which is why
+    /// it is the fallback: it turns the previous behaviour from reliably-wrong into probably-right,
+    /// while `packetFlow` above is the answer that is simply correct.
+    private static var scannedTunnelFileDescriptor: Int32? {
+        var candidate: Int32?
+        for fd: Int32 in 0...1024 where isUtunControlSocket(fd) {
+            candidate = fd
+        }
+        return candidate
     }
 
     /// Returns a WireGuard version.
