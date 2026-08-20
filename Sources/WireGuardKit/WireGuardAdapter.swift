@@ -56,6 +56,37 @@ public class WireGuardAdapter {
     /// Adapter state.
     private var state: State = .stopped
 
+    /// The adapter whose handler is currently installed as wireguard-go's GLOBAL logger.
+    ///
+    /// `wgSetLogger` is a process global holding an UNRETAINED context pointer, and `deinit` used to
+    /// clear it unconditionally. That is correct while a process holds exactly one adapter — true for
+    /// an app extension, whose process dies on every disconnect. It is wrong for a macOS SYSTEM
+    /// extension, whose process is a resident daemon and can hold several: there, an OUTGOING
+    /// adapter's dealloc silently turned wg logging off for the tunnel that is actually running, and
+    /// between that clear and the next install the global pointed at freed memory.
+    ///
+    /// Losing those log lines is not cosmetic. "No `adapter stop failed` in the log" is exactly the
+    /// kind of evidence a teardown investigation leans on, and a silently-disabled logger makes
+    /// absence of a message mean nothing at all.
+    ///
+    /// NOT A COMPLETE FIX, and the gap is worth knowing. If a LATER adapter deallocs FIRST — it
+    /// installed the logger in `init`, then its `start()` threw and it was released while an earlier
+    /// adapter's tunnel is still up — the clear is correct by this rule and the live tunnel still
+    /// loses logging, because nothing re-installs for an already-started adapter. Handling that
+    /// needs the logger installed from `start()` rather than only `init`, or a registry of live
+    /// adapters. Neither is attempted here.
+    /// Guards `installedLoggerContext` AND the `wgSetLogger` call beside it.
+    ///
+    /// Both must move together. Writing the static and calling `wgSetLogger` as two steps loses to
+    /// this interleave: A's deinit reads the static (still A, check passes), B's init writes the
+    /// static and installs B, A resumes and installs nil while clearing the static. wireguard-go is
+    /// then holding B's context while the static says nobody — so B's own deinit skips the clear and
+    /// leaves the global pointing at freed memory. The unconditional clear this replaced could never
+    /// do that, so an unsynchronised guard would be worse than the bug it fixes.
+    private static let loggerLock = NSLock()
+
+    private static var installedLoggerContext: UnsafeMutableRawPointer?
+
     /// Tunnel device file descriptor.
     ///
     /// Resolved from `packetFlow` where possible, and only otherwise by scanning open descriptors.
@@ -185,9 +216,17 @@ public class WireGuardAdapter {
     }
 
     deinit {
-        // Force remove logger to make sure that no further calls to the instance of this class
-        // can happen after deallocation.
-        wgSetLogger(nil, nil)
+        // Force remove logger to make sure that no further calls to the instance of this class can
+        // happen after deallocation — but ONLY if the global still points at US. A later adapter may
+        // already have installed its own, and clearing that one would disable logging for a live
+        // tunnel. See `installedLoggerContext`.
+        let selfContext = Unmanaged.passUnretained(self).toOpaque()
+        WireGuardAdapter.loggerLock.lock()
+        if WireGuardAdapter.installedLoggerContext == selfContext {
+            wgSetLogger(nil, nil)
+            WireGuardAdapter.installedLoggerContext = nil
+        }
+        WireGuardAdapter.loggerLock.unlock()
 
         // Cancel network monitor
         networkMonitor?.cancel()
@@ -338,6 +377,9 @@ public class WireGuardAdapter {
     /// Setup WireGuard log handler.
     private func setupLogHandler() {
         let context = Unmanaged.passUnretained(self).toOpaque()
+        WireGuardAdapter.loggerLock.lock()
+        defer { WireGuardAdapter.loggerLock.unlock() }
+        WireGuardAdapter.installedLoggerContext = context
         wgSetLogger(context) { context, logLevel, message in
             guard let context = context, let message = message else { return }
 
@@ -361,22 +403,41 @@ public class WireGuardAdapter {
     /// - Returns: `PacketTunnelSettingsGenerator`.
     private func setNetworkSettings(_ networkSettings: NEPacketTunnelNetworkSettings) throws {
         var systemError: Error?
-        let condition = NSCondition()
-
-        // Activate the condition
-        condition.lock()
-        defer { condition.unlock() }
+        var didComplete = false
+        let semaphore = DispatchSemaphore(value: 0)
 
         self.packetTunnelProvider?.setTunnelNetworkSettings(networkSettings) { error in
             systemError = error
-            condition.signal()
+            didComplete = true
+            semaphore.signal()
         }
 
         // Packet tunnel's `setTunnelNetworkSettings` times out in certain
         // scenarios & never calls the given callback.
         let setTunnelNetworkSettingsTimeout: TimeInterval = 5 // seconds
 
-        if condition.wait(until: Date().addingTimeInterval(setTunnelNetworkSettingsTimeout)) {
+        // A SEMAPHORE RATHER THAN AN NSCondition, and the difference is not stylistic.
+        //
+        // The condition-variable version signalled WITHOUT holding the condition's lock, which is a
+        // lost-wakeup: the handler could land between the caller evaluating its predicate and
+        // entering `wait`, and the signal would be dropped — surfacing as this 5-second timeout
+        // firing on a call that actually succeeded, and then PROCEEDING ANYWAY, so the failure was
+        // not even visible as one.
+        //
+        // Taking the lock in the handler fixes that and introduces something worse: `NSCondition`'s
+        // mutex is not recursive, and the caller already holds it here. Any synchronous invocation
+        // of the completion handler — an immediate NE error path, or a consumer that overrides
+        // `setTunnelNetworkSettings` on their own provider subclass and calls back inline — would
+        // then deadlock on the calling thread, with the watchdog unable to fire because the thread
+        // never reaches `wait`. A hang is strictly worse than a spurious timeout.
+        //
+        // A semaphore has neither problem: `signal()` needs no lock, so a synchronous handler simply
+        // increments it and the `wait` below returns immediately.
+        //
+        // `didComplete` is checked as well as the wait result because a semaphore, unlike a
+        // condition, carries no predicate of its own — and "timed out" and "completed with no error"
+        // must not collapse into the same branch.
+        if semaphore.wait(timeout: .now() + setTunnelNetworkSettingsTimeout) == .success, didComplete {
             if let systemError = systemError {
                 throw WireGuardAdapterError.setNetworkSettings(systemError)
             }

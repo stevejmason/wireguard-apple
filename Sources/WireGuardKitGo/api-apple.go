@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -56,7 +57,19 @@ type tunnelHandle struct {
 	*device.Logger
 }
 
-var tunnelHandles = make(map[int32]tunnelHandle)
+// tunnelHandles is reachable from every exported entry point, and those are called from Swift on
+// whatever queue the caller happens to be on. WireGuardAdapter serialises its own calls on a
+// per-adapter workQueue, which is enough only while a process holds ONE adapter — true for an app
+// extension, whose process dies on every disconnect, and false for a macOS SYSTEM extension, whose
+// process is a resident daemon that can hold several. deinit also calls wgTurnOff off-queue.
+//
+// An unsynchronised concurrent map write is not a race that corrupts a value: the Go runtime detects
+// it and aborts the process with "fatal error: concurrent map writes", taking the whole network
+// extension down with it.
+var (
+	tunnelHandlesMu sync.Mutex
+	tunnelHandles   = make(map[int32]tunnelHandle)
+)
 
 func init() {
 	signals := make(chan os.Signal)
@@ -100,52 +113,80 @@ func wgTurnOn(settings *C.char, tunFd int32) int32 {
 		unix.Close(dupTunFd)
 		return -1
 	}
-	tun, err := tun.CreateTUNFromFile(os.NewFile(uintptr(dupTunFd), "/dev/tun"), 0)
+	// OWNERSHIP OF dupTunFd PASSES HERE. os.NewFile takes the descriptor, and from this point the
+	// raw number must never be closed directly: the File owns it, then the Device owns the File. A
+	// direct unix.Close is a DOUBLE CLOSE, and in a long-lived process the second one lands on
+	// whatever unrelated object has since been handed that descriptor number.
+	//
+	// Closing the *os.File instead of the number is safe even where CreateTUNFromFile has already
+	// closed it — os.File records that it is closed and returns ErrClosed rather than closing twice.
+	tunFile := os.NewFile(uintptr(dupTunFd), "/dev/tun")
+	tunDev, err := tun.CreateTUNFromFile(tunFile, 0)
 	if err != nil {
 		logger.Errorf("Unable to create new tun device from fd: %v", err)
-		unix.Close(dupTunFd)
+		tunFile.Close()
 		return -1
 	}
 	logger.Verbosef("Attaching to interface")
-	dev := device.NewDevice(tun, conn.NewStdNetBind(), logger)
+	dev := device.NewDevice(tunDev, conn.NewStdNetBind(), logger)
 
 	err = dev.IpcSet(C.GoString(settings))
 	if err != nil {
 		logger.Errorf("Unable to set IPC settings: %v", err)
-		unix.Close(dupTunFd)
+		// dev.Close() and not a bare descriptor close: NewDevice has already started the device's
+		// goroutines, so closing the fd alone left a running Device with a dead tun behind it — a
+		// leak on top of the double close.
+		dev.Close()
 		return -1
 	}
 
 	dev.Up()
 	logger.Verbosef("Device started")
 
+	tunnelHandlesMu.Lock()
 	var i int32
 	for i = 0; i < math.MaxInt32; i++ {
 		if _, exists := tunnelHandles[i]; !exists {
 			break
 		}
 	}
-	if i == math.MaxInt32 {
-		unix.Close(dupTunFd)
+	exhausted := i == math.MaxInt32
+	if !exhausted {
+		tunnelHandles[i] = tunnelHandle{dev, logger}
+	}
+	tunnelHandlesMu.Unlock()
+
+	if exhausted {
+		// Closed outside the lock, same reasoning as wgTurnOff: Device.Close() waits on the
+		// device's goroutines, and no unrelated tunnel should queue behind that.
+		dev.Close()
 		return -1
 	}
-	tunnelHandles[i] = tunnelHandle{dev, logger}
 	return i
 }
 
 //export wgTurnOff
 func wgTurnOff(tunnelHandle int32) {
+	tunnelHandlesMu.Lock()
 	dev, ok := tunnelHandles[tunnelHandle]
+	if ok {
+		delete(tunnelHandles, tunnelHandle)
+	}
+	tunnelHandlesMu.Unlock()
 	if !ok {
 		return
 	}
-	delete(tunnelHandles, tunnelHandle)
+	// Closed OUTSIDE the lock: Device.Close() waits for the device's goroutines to wind down, and
+	// holding a process-wide mutex across that would serialise an unrelated tunnel's start behind
+	// this one's teardown.
 	dev.Close()
 }
 
 //export wgSetConfig
 func wgSetConfig(tunnelHandle int32, settings *C.char) int64 {
+	tunnelHandlesMu.Lock()
 	dev, ok := tunnelHandles[tunnelHandle]
+	tunnelHandlesMu.Unlock()
 	if !ok {
 		return 0
 	}
@@ -162,7 +203,9 @@ func wgSetConfig(tunnelHandle int32, settings *C.char) int64 {
 
 //export wgGetConfig
 func wgGetConfig(tunnelHandle int32) *C.char {
+	tunnelHandlesMu.Lock()
 	device, ok := tunnelHandles[tunnelHandle]
+	tunnelHandlesMu.Unlock()
 	if !ok {
 		return nil
 	}
@@ -175,7 +218,9 @@ func wgGetConfig(tunnelHandle int32) *C.char {
 
 //export wgBumpSockets
 func wgBumpSockets(tunnelHandle int32) {
+	tunnelHandlesMu.Lock()
 	dev, ok := tunnelHandles[tunnelHandle]
+	tunnelHandlesMu.Unlock()
 	if !ok {
 		return
 	}
@@ -195,7 +240,9 @@ func wgBumpSockets(tunnelHandle int32) {
 
 //export wgDisableSomeRoamingForBrokenMobileSemantics
 func wgDisableSomeRoamingForBrokenMobileSemantics(tunnelHandle int32) {
+	tunnelHandlesMu.Lock()
 	dev, ok := tunnelHandles[tunnelHandle]
+	tunnelHandlesMu.Unlock()
 	if !ok {
 		return
 	}
