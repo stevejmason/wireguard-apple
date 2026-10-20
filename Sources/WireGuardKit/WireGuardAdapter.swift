@@ -372,6 +372,23 @@ public class WireGuardAdapter {
         }
     }
 
+    /// Re-open the backend's UDP sockets now, exactly as a network path change does on macOS
+    /// (`wgBumpSockets`). A no-op unless the tunnel is started.
+    ///
+    /// For a long-lived provider whose sends start failing with `sendto: broken pipe` (EPIPE): the
+    /// system has shut the socket down under it. Observed on macOS when a path change — the tunnel's
+    /// own interface appearing, or network settings being re-applied by `update` — makes the backend
+    /// re-bind in the same instant the settings are being applied; the fresh socket is dead on
+    /// arrival and nothing re-binds it again until the next path change, so the tunnel sends
+    /// nothing, indefinitely. The provider calls this to re-bind once the settings have settled.
+    public func bumpSockets() {
+        workQueue.async {
+            guard case .started(let handle, _) = self.state else { return }
+            self.logHandler(.verbose, "Re-binding sockets on request")
+            wgBumpSockets(handle)
+        }
+    }
+
     // MARK: - Private methods
 
     /// Setup WireGuard log handler.
